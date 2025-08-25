@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import json
 import os
+import time
 from datetime import datetime
 import glob
 import uuid
@@ -59,10 +60,12 @@ class AnalysisResponse(BaseModel):
 
 class JobStatus(BaseModel):
     job_id: str
+    start_time: Optional[float] = None
     status: str
     progress: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    trading_agent: Any = None  # Store the trading agent instance here
 
 # In-memory job storage (in production, use Redis or database)
 jobs: Dict[str, JobStatus] = {}
@@ -77,6 +80,15 @@ async def health_check():
 
 async def run_analysis_task(job_id: str, symbol: str, analysis_date: str, config_overrides: Dict[str, Any] = None):
     """Background task to run the trading analysis without blocking the event loop"""
+    
+    def execution_time() -> Optional[str]:
+        if jobs[job_id].status == "completed" or jobs[job_id].status == "failed":
+            return f"{time.time() - jobs[job_id].start_time:.2f} seconds"
+        else:
+            return None
+
+    jobs[job_id].start_time = time.time()  # Save the start time in the job
+
     try:
         jobs[job_id].status = "running"
         jobs[job_id].progress = "Initializing TradingAgents..."
@@ -87,16 +99,13 @@ async def run_analysis_task(job_id: str, symbol: str, analysis_date: str, config
             config.update(config_overrides)
 
         jobs[job_id].progress = "Setting up trading graph..."
-
-        # Define blocking work as sync function
-        def _do_work():
-            ta = TradingAgentsGraph(debug=True, config=config)
-            jobs[job_id].progress = f"Analyzing {symbol} for {analysis_date}..."
-            _, decision = ta.propagate(symbol, analysis_date)
-            return decision
-
-        # Run blocking work in threadpool so the event loop stays responsive
-        decision = await run_in_threadpool(_do_work)
+        # Create and store the trading agent instance
+        ta = TradingAgentsGraph(debug=True, config=config)
+        jobs[job_id].trading_agent = ta  # Store the instance
+        jobs[job_id].progress = f"Analyzing {symbol} for {analysis_date}..."
+        
+        # Run the propagate method in a threadpool
+        _, decision = await run_in_threadpool(ta.propagate, symbol, analysis_date)
 
         jobs[job_id].status = "completed"
         jobs[job_id].result = {
@@ -104,6 +113,20 @@ async def run_analysis_task(job_id: str, symbol: str, analysis_date: str, config
             "date": analysis_date,
             "decision": decision,
             "completed_at": datetime.now().isoformat(),
+            "execution_time": execution_time()
+        }
+        jobs[job_id].progress = "Analysis completed successfully"
+
+    except Exception as e:
+        jobs[job_id].status = "failed"
+        jobs[job_id].error = str(e)
+        jobs[job_id].progress = f"Error: {str(e)}"
+        jobs[job_id].result = {
+            "symbol": symbol,
+            "date": analysis_date,
+            "decision": decision,
+            "completed_at": datetime.now().isoformat(),
+            "execution_time": execution_time()
         }
         jobs[job_id].progress = "Analysis completed successfully"
 
@@ -342,14 +365,52 @@ async def get_jobs():
     """Get all jobs"""
     job_lst = []
     for job_id, job in jobs.items():
-        job_lst.append({
+        job_dict = {
             "job_id": job_id,
             "status": job.status,
             "progress": job.progress,
             "result": job.result,
-            "error": job.error
-        })
+            "error": job.error,
+        }
+        
+        # Add execution_time if available
+        if hasattr(job, 'start_time') and job.start_time is not None:
+            if job.status in ["completed", "failed"]:
+                job_dict["execution_time"] = f"{time.time() - job.start_time:.2f} seconds"
+        
+        job_lst.append(job_dict)
+    
     return {"jobs": job_lst}
+
+@app.post("/reflect-on-analysis/{symbol}/{date}", response_model=AnalysisResponse)
+async def reflect_on_analysis(symbol: str, date: str, request: dict, background_tasks: BackgroundTasks):
+    """Get latest financial situation memory for a specific analysis"""
+    returns_losses = request.get("returns_losses")
+    if returns_losses is None:
+        raise HTTPException(status_code=400, detail="returns_losses is required in request body")
+    
+    # Find the job that matches the symbol and date
+    matching_job = None
+    for job_id, job in jobs.items():
+        if (job.result.get("symbol") == symbol.upper() and 
+            job.result.get("date") == date and
+            hasattr(job, 'trading_agent') and 
+            job.trading_agent):
+            matching_job = job
+            break
+    
+    if not matching_job:
+        raise HTTPException(status_code=404, detail=f"No active job found for {symbol} on {date}")
+    
+    background_tasks.add_task(
+        matching_job.trading_agent.reflect_and_remember, returns_losses
+    )
+
+    return AnalysisResponse(
+        job_id=matching_job.job_id,
+        status="reflecting",
+        message=f"Reflecting on analysis for {symbol} on {date}"
+    )
 
 @app.get("/config")
 async def get_default_config():
@@ -358,4 +419,4 @@ async def get_default_config():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
